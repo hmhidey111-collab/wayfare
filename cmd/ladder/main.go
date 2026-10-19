@@ -6,6 +6,7 @@
 //
 //	go run ./cmd/ladder                  # USDC -> NGNC
 //	go run ./cmd/ladder -to GHSC         # USDC -> GHSC, benchmarked against GHS
+//	go run ./cmd/ladder -to NGNT         # USDC -> NGNT, benchmarked against NGN
 //	go run ./cmd/ladder -to GHSC -json   # same, as JSON on stdout
 //	go run ./cmd/ladder -checks=false    # same, without counterparty checks
 //
@@ -51,18 +52,18 @@ var corridors = map[string]corridor{
 	"NGNC": {asset.NGNC(), "NGN"},
 	"GHSC": {asset.GHSC(), "GHS"},
 	"KESC": {asset.KESC(), "KES"},
+	"NGNT": {asset.NGNT(), "NGN"},
 }
 
 func main() {
 	var (
-		to        = flag.String("to", "NGNC", "destination asset code (NGNC, GHSC, KESC)")
+		to        = flag.String("to", "NGNC", "destination asset code (NGNC, GHSC, KESC, NGNT)")
 		sizesFlag = flag.String("sizes", "0.1,1,5,10,25,50,100,250,500,1000,2500,5000",
 			"comma-separated send amounts in USDC")
 		jsonOut = flag.Bool("json", false, "emit JSON on stdout instead of the text table")
 		record  = flag.String("record", "",
 			"record upstream responses as a snapshot in a new directory under this parent")
-		refName = flag.String("ref", "exchangerate-api",
-			"reference rate provider: exchangerate-api or currency-api")
+		refName    = flag.String("ref", defaultRefProvider, refHelp())
 		allowDirty = flag.Bool("allow-dirty", false,
 			"record even though the working tree is modified, marking the manifest dirty")
 		checksFlag = flag.Bool("checks", true,
@@ -74,7 +75,7 @@ func main() {
 
 	c, ok := corridors[strings.ToUpper(*to)]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "unknown destination %q; known: NGNC, GHSC, KESC\n", *to)
+		fmt.Fprintf(os.Stderr, "unknown destination %q; known: NGNC, GHSC, KESC, NGNT\n", *to)
 		os.Exit(2)
 	}
 
@@ -99,7 +100,7 @@ func main() {
 	dexClient := &dex.Client{}
 
 	if *record != "" {
-		dirty, err := requireCleanTree(*allowDirty)
+		dirty, err := requireCleanTree(".", *allowDirty)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -249,6 +250,8 @@ func erroredRungs(l *route.LadderResult) []string {
 	return out
 }
 
+const defaultRefProvider = "exchangerate-api"
+
 // refSource bundles a reference provider with the two things a caller needs
 // that the Provider interface deliberately does not expose: where it fetches
 // from, for a snapshot manifest, and how to give it a recording HTTP client.
@@ -258,22 +261,64 @@ type refSource struct {
 	setClient func(*http.Client)
 }
 
+func newExchangeRateAPI() refSource {
+	p := &refrate.ExchangeRateAPI{}
+	return refSource{
+		provider:  p,
+		baseURL:   refrate.DefaultExchangeRateAPI,
+		setClient: func(c *http.Client) { p.Client = c },
+	}
+}
+
+func newCurrencyAPI() refSource {
+	p := &refrate.CurrencyAPI{}
+	return refSource{
+		provider:  p,
+		baseURL:   refrate.DefaultCurrencyAPI,
+		setClient: func(c *http.Client) { p.Client = c },
+	}
+}
+
+// refConstructors registers the constructor for each supported reference provider.
+// Valid provider names in the flag help and unknown-provider errors are generated
+// directly from this list via Provider.Name().
+var refConstructors = []func() refSource{
+	newExchangeRateAPI,
+	newCurrencyAPI,
+}
+
+// refProviderNames returns the valid provider names derived from the provider constructors.
+func refProviderNames() []string {
+	names := make([]string, 0, len(refConstructors))
+	for _, c := range refConstructors {
+		names = append(names, c().provider.Name())
+	}
+	return names
+}
+
+// refHelp returns the help text for the -ref flag, listing all available providers.
+func refHelp() string {
+	return fmt.Sprintf("reference rate provider: %s", strings.Join(refProviderNames(), ", "))
+}
+
 // referenceProvider resolves the -ref flag.
 //
 // An unknown name is an error rather than a fallback to the default. Silently
 // substituting a different benchmark than the one asked for would mislabel
 // every figure the run produces.
 func referenceProvider(name string) (refSource, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "exchangerate-api", "":
-		p := &refrate.ExchangeRateAPI{}
-		return refSource{p, refrate.DefaultExchangeRateAPI, func(c *http.Client) { p.Client = c }}, nil
-	case "currency-api":
-		p := &refrate.CurrencyAPI{}
-		return refSource{p, refrate.DefaultCurrencyAPI, func(c *http.Client) { p.Client = c }}, nil
+	clean := strings.ToLower(strings.TrimSpace(name))
+	if clean == "" {
+		clean = defaultRefProvider
+	}
+	for _, constructor := range refConstructors {
+		src := constructor()
+		if strings.EqualFold(src.provider.Name(), clean) {
+			return src, nil
+		}
 	}
 	return refSource{}, fmt.Errorf(
-		"unknown reference provider %q; known: exchangerate-api, currency-api", name)
+		"unknown reference provider %q; known: %s", name, strings.Join(refProviderNames(), ", "))
 }
 
 // sizeStrings renders ladder sizes for a snapshot manifest. They are decimal
@@ -298,13 +343,19 @@ func gitRevision() string {
 	return strings.TrimSpace(string(out))
 }
 
-// dirtyFiles lists tracked files modified relative to HEAD.
+// dirtyFiles lists files whose working-tree state differs from HEAD:
+// modified tracked files and untracked files alike.
+//
+// An untracked file is included because it is part of the working tree the
+// recorded bytes were produced from even though HEAD does not contain it, so
+// git_revision would not pin the code that generated them. Porcelain lines
+// are returned verbatim, status code and all (` M f.go`, `?? scratch.txt`).
 //
 // An empty result with a nil error means a clean tree; a nil result with an
 // error means git could not answer, which is not the same thing and must not
 // be reported as clean.
-func dirtyFiles() ([]string, error) {
-	out, err := exec.Command("git", "status", "--porcelain", "--untracked-files=no").Output()
+func dirtyFiles(dir string) ([]string, error) {
+	out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
 	if err != nil {
 		return nil, fmt.Errorf("could not determine whether the tree is clean: %w", err)
 	}
@@ -324,6 +375,10 @@ func dirtyFiles() ([]string, error) {
 // generate the bytes — which is worse than recording nothing, because the
 // field looks like provenance and is consulted as though it were.
 //
+// Dirty means anything `git status` reports: a modified tracked file or an
+// untracked file. Either way HEAD does not describe the working tree the
+// bytes came from.
+//
 // This repository already contains the failure: the GHSC and KESC snapshots
 // recorded revision e2be414, a commit predating the snapshot package that
 // wrote them. Both were re-captured once this check existed.
@@ -331,8 +386,8 @@ func dirtyFiles() ([]string, error) {
 // -allow-dirty exists for local experiments and marks the manifest, so a
 // snapshot whose provenance is approximate says so in the artifact rather
 // than only in the shell that made it.
-func requireCleanTree(allowDirty bool) (dirty bool, err error) {
-	files, err := dirtyFiles()
+func requireCleanTree(dir string, allowDirty bool) (dirty bool, err error) {
+	files, err := dirtyFiles(dir)
 	if err != nil {
 		// Not in a git checkout, or git is unavailable. Recording is still
 		// possible; the revision is simply absent, which the manifest
@@ -451,6 +506,27 @@ func printTable(ctx context.Context, result *route.LadderResult, c corridor, ref
 			fmt.Printf(" (worst: %s)", worst)
 		}
 		fmt.Println(" — pass -checks=false to skip")
+
+		if len(findings.Metrics) > 0 {
+			measured := 0
+			for _, m := range findings.Metrics {
+				if m.Determined {
+					measured++
+				}
+			}
+			fmt.Printf("metrics: %d measured, %d undetermined\n", measured, len(findings.Metrics)-measured)
+			for _, m := range findings.Metrics {
+				if m.Determined {
+					fmt.Printf("  %-25s %s %s\n", m.ID, m.Value.String(), m.Unit)
+				} else {
+					reason := m.Reason
+					if reason == "" {
+						reason = m.Summary
+					}
+					fmt.Printf("  %-25s undetermined (%s)\n", m.ID, reason)
+				}
+			}
+		}
 	}
 	if priced == 0 {
 		fmt.Printf("no size could be priced for USDC -> %s\n", c.dest.Code)

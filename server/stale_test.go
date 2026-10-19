@@ -120,6 +120,47 @@ func TestStaleReadingIsLabelled(t *testing.T) {
 	}
 }
 
+// TestStaleHTTPServesStoredFindings covers the full history response path for
+// issue #112. It is not enough for staleJSON to reconstruct findings in
+// isolation: the record conversion and HTTP fallback must preserve the block
+// a client uses to explain counterparty facts after a live fetch fails.
+func TestStaleHTTPServesStoredFindings(t *testing.T) {
+	live := route.WithFindings(
+		route.ToCorridorJSON(wellPopulatedLadderResult(), "USD/NGN"),
+		findingsFixture(),
+	)
+	rec := runstore.FromCorridorJSON(live)
+	if len(rec.Checks) == 0 && len(rec.Metrics) == 0 {
+		t.Fatal("test setup: findings were not carried into the stored record")
+	}
+
+	st, err := runstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Append(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := getJSON(t, deadServer(t, st).URL+"/api/corridor?to=NGNC&sizes=100")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %v", status, body)
+	}
+
+	findings, ok := body["findings"].(map[string]any)
+	if !ok {
+		t.Fatal("stale response omitted the stored findings block")
+	}
+	checks, ok := findings["checks"].([]any)
+	if !ok || len(checks) != len(live.Findings.Checks) {
+		t.Fatalf("stale findings checks = %v, want %d entries", findings["checks"], len(live.Findings.Checks))
+	}
+	metrics, ok := findings["metrics"].([]any)
+	if !ok || len(metrics) != len(live.Findings.Metrics) {
+		t.Fatalf("stale findings metrics = %v, want %d entries", findings["metrics"], len(live.Findings.Metrics))
+	}
+}
+
 // TestStaleServesReferenceFetchedAt covers backlog #7: a stored reading must
 // carry reference_fetched_at so a reader can tell how old the benchmark was
 // when the reading was taken — a rate reused from the cache is older than the
@@ -384,6 +425,73 @@ func TestStaleShapeMatchesLiveShape(t *testing.T) {
 		if _, ok := liveBody[field]; !ok {
 			t.Errorf("live response is missing %q", field)
 		}
+	}
+}
+
+// TestStaleQuoteCarriesDEXKind pins that a stored quote's kind survives the
+// stale path, both for a priced rung and for the recommendation, matching
+// route.QuoteJSON.Kind on the live path. See issue #181: conflating an
+// anchor's own rails with on-chain DEX execution would misattribute the
+// loss, and a stale reading dropping the distinction would be exactly that.
+func TestStaleQuoteCarriesDEXKind(t *testing.T) {
+	dir := t.TempDir()
+	st, err := runstore.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC().Add(-3 * time.Hour)
+	rec := &runstore.Record{
+		RecordedAt: at,
+		Corridor:   "USDC-NGNC",
+		Integrity:  "DIRECT",
+		Reference: runstore.Reference{
+			Mid: "1350.2568", Source: "currency-api",
+			AsOf: at.Format(time.RFC3339), ScoredAgainst: "currency-api",
+		},
+		FloorLossPct: "4.46", FloorSize: "100",
+		WorstLossPct: "4.46", WorstSize: "100",
+		RecommendedSize: "100",
+		Finding:         "USDC to NGNC prices directly.",
+		Rungs: []runstore.Rung{{
+			SendAmount: "100", Priced: true, Integrity: "DIRECT",
+			ReceiveAmount: "129000", EffectiveRate: "1290",
+			LossPct: "4.46", Verdict: "FAIR", Path: "USDC -> NGNC",
+		}},
+		Recommended: &runstore.Rung{
+			SendAmount: "100", Priced: true, Integrity: "DIRECT",
+			ReceiveAmount: "129000", EffectiveRate: "1290",
+			LossPct: "4.46", Verdict: "FAIR", Path: "USDC -> NGNC",
+		},
+	}
+	if err := st.Append(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := deadServer(t, st)
+	status, body := getJSON(t, srv.URL+"/api/corridor?to=NGNC&sizes=100")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %v", status, body)
+	}
+
+	rungs, _ := body["rungs"].([]any)
+	if len(rungs) == 0 {
+		t.Fatal("expected at least one rung")
+	}
+	rung, _ := rungs[0].(map[string]any)
+	quote, _ := rung["quote"].(map[string]any)
+	if quote == nil {
+		t.Fatal("expected the rung to carry a quote")
+	}
+	if quote["kind"] != "dex" {
+		t.Errorf(`rung quote kind = %v, want "dex"`, quote["kind"])
+	}
+
+	recommended, _ := body["recommended"].(map[string]any)
+	if recommended == nil {
+		t.Fatal("expected a recommended quote")
+	}
+	if recommended["kind"] != "dex" {
+		t.Errorf(`recommended kind = %v, want "dex"`, recommended["kind"])
 	}
 }
 

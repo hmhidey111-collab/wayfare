@@ -360,6 +360,7 @@ func TestStaleSelectsFresherFeedRegardlessOfOrder(t *testing.T) {
 		{"fresh primary", fresh, stale},
 		{"fresh secondary", stale, fresh},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := rateOf(t, &Cross{Primary: tc.primary, Secondary: tc.secondary})
@@ -789,5 +790,50 @@ func TestPrimaryUnparseableFallsToSecondary(t *testing.T) {
 	}
 	if !strings.Contains(r.Note, "primary was returned an unparseable response") {
 		t.Errorf("Note = %q, want it to say 'primary was returned an unparseable response'", r.Note)
+	}
+}
+
+// TestNeverAverageTwoProviderMids pins the rule that a cross-checked mid is
+// always one provider's own figure, never the arithmetic mean of two.
+//
+// A blended mid names no provider: a reader cannot tell which source to
+// verify, and the figure is one neither provider published. The rule is
+// stated in the README and in ADR-001, so it is asserted here rather than
+// left to trust — across an agreeing pair, a disagreeing pair, and a pair
+// far enough apart to be a malfunction.
+func TestNeverAverageTwoProviderMids(t *testing.T) {
+	now := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name               string
+		primary, secondary string
+	}{
+		{"agree", "1350", "1351"},
+		{"disagree", "1300", "1365"},
+		{"malfunction", "100", "500"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := rateOf(t, &Cross{
+				Primary:   &fakeProvider{name: "primary", mid: tc.primary, asOf: now},
+				Secondary: &fakeProvider{name: "secondary", mid: tc.secondary, asOf: now},
+			})
+
+			p := decimal.RequireFromString(tc.primary)
+			s := decimal.RequireFromString(tc.secondary)
+			mean := p.Add(s).Div(decimal.NewFromInt(2))
+
+			if r.Mid.Equal(mean) {
+				t.Errorf("Mid = %s is the arithmetic mean of %s and %s; a blended mid names no provider",
+					r.Mid, p, s)
+			}
+			if !r.Mid.Equal(p) && !r.Mid.Equal(s) {
+				t.Errorf("Mid = %s is neither provider's figure (%s, %s)", r.Mid, p, s)
+			}
+			if r.Source != "primary" && r.Source != "secondary" {
+				t.Errorf("Source = %q, want one named provider", r.Source)
+			}
+		})
 	}
 }

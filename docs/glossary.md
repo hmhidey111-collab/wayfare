@@ -24,6 +24,7 @@ classifications:
 |:---|:---|:---|
 | [Severity](#severity) | How bad is a check failure? | `checks/checks.go` |
 | [Parallel status](#parallel-status) | Was a street-market rate available? | `refrate/parallel.go` |
+| [Quote kind](#quote-kind) | Which rail priced this quote — on-chain DEX or an anchor's own rate? | `route/route.go` |
 | [Divergence trend](#divergence-trend) | Are the two reference providers agreeing more or less over time? | `analysis/divergence.go` |
 
 ---
@@ -277,11 +278,39 @@ spread of nothing and a spread that could not be read are different facts,
 and zero is a plausible-looking number for the second.
 
 **Source:** `checks/metric.go` — `MetricResult`, `RunMetric()`.
-`checks/checks.md` — the two-shape contract.
+[docs/checks.md](checks.md) — the two-shape contract.
 Checked 2026-08-25.
 
 ---
 
+## Quote kind
+
+**Question:** Which rail priced this quote — on-chain DEX or an anchor's own rate?
+
+Wayfare measures on-chain DEX liquidity. An anchor's own SEP-38 rails can price
+the same pair differently, and a client that could not tell the two apart
+would risk attributing loss to the wrong one.
+
+| Kind | Meaning |
+|:---|:---|
+| `dex` | Settled entirely on-chain through Horizon path payments. Ends in a token, not a bank account — a separate redemption step still has its own cost. |
+| `anchor-sep38` | A quote from an anchor's RFQ endpoint, which can terminate in an actual bank account. |
+
+**Every quote in a response is `dex` today.** Live pathfinding is the only
+thing this project prices; anchor pricing is tracked separately (a live
+SEP-38 round-trip has never been performed — see the verification status in
+[README.md](../README.md)). `kind` is on the wire from the start anyway, so a
+client is never in the position of having to guess which rail a number came
+from once anchor pricing lands, or of silently comparing two different
+products as though they were one.
+
+`Source` (a free-form string — an anchor's domain, or `"stellar-dex"`) already
+names *where* a quote came from. `Kind` is the structured, closed-set answer
+to *what kind of rail that is*, which a client can switch on without parsing
+a domain name.
+
+**Source:** `route/route.go` — `Kind`, `KindDEX`, `KindAnchorSEP38`, `Quote`.
+`route/wire.go` — `QuoteJSON.Kind`, `ToQuoteJSON()`.
 ## Divergence trend
 
 **Question:** Are the two reference providers agreeing more or less over time?
@@ -309,7 +338,8 @@ smaller than the number of runs in the response.
 **Regime is not reported here.** `analysis.DefaultRegimeThresholds` is
 calibrated to loss percentages, an unrelated scale — applying it to a
 divergence series would publish a classification against thresholds nobody
-chose for that purpose.
+chose for that purpose. The thresholds themselves, and the justification for
+them, are in [regime-classification.md](regime-classification.md).
 
 **Never moves a verdict or an integrity state.** Like every check and metric
 in this project, this is a measurement of the benchmark's own behaviour,
