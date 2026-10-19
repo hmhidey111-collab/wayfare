@@ -1555,6 +1555,386 @@ func TestPriceImpactMetricDescriptorIsValid(t *testing.T) {
 	}
 }
 
+// TestPriceImpactMetricMalfunctionReferenceIsUndetermined guards issue #161:
+// when the reference cross-check is MALFUNCTION, no derived quantity may be
+// computed because the benchmark itself is suspect. Price impact is one such
+// derived quantity — a precise-looking percentage would misrepresent a
+// measurement that cannot be validated.
+func TestPriceImpactMetricMalfunctionReferenceIsUndetermined(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"} // must never be dialed
+
+	subject := Subject{
+		Send:               asset.USDC(),
+		Receive:            asset.NGNC(),
+		ReferenceAgreement: "MALFUNCTION",
+	}
+
+	impact := PriceImpactMetric{
+		DEX:       poisoned,
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+	r := RunMetric(ctx(), impact, subject)
+
+	if r.Determined {
+		t.Error("a MALFUNCTION reference must not produce a determined price impact")
+	}
+	if !strings.Contains(r.Reason, "MALFUNCTION") {
+		t.Errorf("reason = %q, want it to name MALFUNCTION as the cause", r.Reason)
+	}
+	if !strings.Contains(r.Reason, "unscorable") {
+		t.Errorf("reason = %q, want it to name the unscorable reference", r.Reason)
+	}
+}
+
+// TestPriceImpactMetricMalfunctionShortCircuitsBeforeNetwork guards that the
+// MALFUNCTION check runs before any network call. The poisoned client above
+// must never be dialed — this test would hang or fail if the guard were
+// placed after the pathfinding calls.
+func TestPriceImpactMetricMalfunctionShortCircuitsBeforeNetwork(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+
+	subject := Subject{
+		Send:               asset.USDC(),
+		Receive:            asset.NGNC(),
+		ReferenceAgreement: "MALFUNCTION",
+	}
+
+	start := time.Now()
+	r := RunMetric(ctx(), PriceImpactMetric{DEX: poisoned}, subject)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %s; a MALFUNCTION short-circuit should return immediately, "+
+			"without attempting to dial %s", elapsed, poisoned.HorizonURL)
+	}
+	if r.Determined {
+		t.Fatal("expected an undetermined result")
+	}
+}
+
+// TestPriceImpactMetricEmptyReferenceAgreementProceeds pins that an empty
+// (unknown) ReferenceAgreement does not suppress the metric. Absent
+// information is not evidence of malfunction — the metric proceeds when the
+// caller has not supplied a reference agreement state.
+func TestPriceImpactMetricEmptyReferenceAgreementProceeds(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	// Empty ReferenceAgreement — the caller did not supply one.
+	r := RunMetric(ctx(), impact, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact with empty ReferenceAgreement should still determine, got: %s", r.Reason)
+	}
+}
+
+// price impact curve -----------------------------------------------------------
+//
+// GitHub issue #159: PriceImpactMetric should report the full curve shape
+// across multiple sizes, not just a single degradation figure.
+
+func TestPriceImpactCurveFromRecordedPaths(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-curve")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(10),
+			decimal.NewFromInt(100),
+			decimal.NewFromInt(1000),
+			decimal.NewFromInt(5000),
+		},
+	}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("price impact curve undetermined: %s", r.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned nil curve for a determined result")
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if r.Value.IsNegative() {
+		t.Errorf("max impact = %s, must never be negative", r.Value)
+	}
+
+	// The curve should have 5 points (all 5 sizes found paths).
+	if got := len(curve.Points); got != 5 {
+		t.Fatalf("curve points = %d, want 5", got)
+	}
+
+	// The reference rate should be the rate at the smallest size.
+	if curve.ReferenceRate.IsZero() {
+		t.Error("reference rate must not be zero")
+	}
+
+	// The first point (smallest size) should have zero impact.
+	if !curve.Points[0].ImpactPct.IsZero() {
+		t.Errorf("first point impact = %s, want 0 (reference point)", curve.Points[0].ImpactPct)
+	}
+
+	// Impact should be non-decreasing (later sizes degrade at least as
+	// much as earlier ones — the fixture is monotonic).
+	var prevImpact decimal.Decimal
+	for i, p := range curve.Points {
+		if p.ImpactPct.LessThan(prevImpact) {
+			t.Errorf("point %d impact %s < previous %s, curve is not monotonic",
+				i, p.ImpactPct, prevImpact)
+		}
+		prevImpact = p.ImpactPct
+	}
+
+	// The last point should have positive impact (the fixture degrades).
+	if curve.Points[len(curve.Points)-1].ImpactPct.IsZero() {
+		t.Error("last point has zero impact; the fixture should show degradation")
+	}
+
+	// Evidence should contain each point.
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+	for _, p := range curve.Points {
+		if !strings.Contains(r.Evidence[0].Observed, "size="+p.Size.StringFixed(1)) {
+			t.Errorf("evidence does not mention size %s", p.Size)
+		}
+	}
+
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestPriceImpactCurveBackwardCompatibleProbeFull(t *testing.T) {
+	// When only ProbeSize and FullSize are set (no Sizes), the metric
+	// should behave exactly as before — a two-point comparison.
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX:       c,
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+
+	// Empty ReferenceAgreement — the caller did not supply one.
+	r := RunMetric(ctx(), impact, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact with empty ReferenceAgreement should still determine, got: %s", r.Reason)
+	}
+}
+
+// TestPriceImpactMetricScorableReferenceAgreementsProceeds pins that
+// non-MALFUNCTION agreement states (AGREE, DISAGREE, SINGLE, STALE) do not
+// suppress the metric. Only MALFUNCTION does.
+func TestPriceImpactMetricScorableReferenceAgreementsProceeds(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	for _, agree := range []string{"AGREE", "DISAGREE", "SINGLE", "STALE"} {
+		r := RunMetric(ctx(), impact, Subject{
+			Send:               asset.USDC(),
+			Receive:            asset.NGNC(),
+			ReferenceAgreement: agree,
+		})
+		if !r.Determined {
+			t.Errorf("ReferenceAgreement=%s should not suppress price impact, got undetermined: %s",
+				agree, r.Reason)
+		}
+	}
+}
+
+func TestPriceImpactCurveFlatWhenRatesIdentical(t *testing.T) {
+	// The usdc-ngnc-strictsend snapshot returns the same body for both
+	// sizes → the curve should be flat (zero impact at every point).
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("price impact undetermined: %s", r.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned nil curve for a determined result")
+	}
+	if got := len(curve.Points); got != 2 {
+		t.Fatalf("curve points = %d, want 2 (probe + full)", got)
+	}
+	// Both points use the same fixture → same rate → zero impact.
+	if !curve.Points[1].ImpactPct.IsZero() {
+		t.Errorf("impact = %s, want 0 when both sizes return the same rate",
+			curve.Points[1].ImpactPct)
+	}
+}
+
+func TestPriceImpactCurveReportsImprovingRates(t *testing.T) {
+	// The second size deliberately has a better rate than the reference. The
+	// metric must preserve that observation as a negative impact rather than
+	// flattening it to zero and making the curve appear monotonic.
+	bodies := map[string]string{
+		"1":   "100",
+		"10":  "1100",
+		"100": "9000",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destination, ok := bodies[r.URL.Query().Get("source_amount")]
+		if !ok {
+			http.Error(w, "unrecorded size", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, `{"_embedded":{"records":[{
+      "source_asset_type":"credit_alphanum4","source_asset_code":"USDC",
+      "source_amount":%q,
+      "destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC",
+      "destination_amount":%q,"path":[]}]}}`, r.URL.Query().Get("source_amount"), destination)
+	}))
+	defer srv.Close()
+
+	impact := PriceImpactMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(10), decimal.NewFromInt(100)},
+	}
+	curve, result := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	if !result.Determined {
+		t.Fatalf("improving curve was undetermined: %s", result.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned no curve for a determined result")
+	}
+	if got, want := curve.Points[1].ImpactPct.StringFixed(2), "-10.00"; got != want {
+		t.Errorf("improving point impact = %s, want %s", got, want)
+	}
+	if !strings.Contains(result.Evidence[0].Observed, "impact=-10.0000%") {
+		t.Errorf("evidence = %q, want the improving point to remain reportable", result.Evidence[0].Observed)
+	}
+}
+
+func TestPriceImpactCurveAllSizesFail(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX:   c,
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("all sizes failing must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("all sizes failing must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveNilDEX(t *testing.T) {
+	impact := PriceImpactMetric{}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("nil DEX must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveEmptySubject(t *testing.T) {
+	impact := PriceImpactMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
+	curve, r := impact.RunCurve(ctx(), Subject{})
+	if r.Determined {
+		t.Error("empty subject must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("empty subject must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveNoMarket(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+	impact := PriceImpactMetric{DEX: poisoned}
+	curve, r := impact.RunCurve(ctx(), Subject{
+		Send: asset.USDC(), Receive: asset.KESC(), Integrity: "NO-MARKET",
+	})
+	if r.Determined {
+		t.Error("NO-MARKET corridor must not produce a determined result")
+	}
+	if curve != nil {
+		t.Error("NO-MARKET must return a nil curve")
+	}
+	if !strings.Contains(r.Reason, "NO-MARKET") {
+		t.Errorf("reason = %q, want it to name NO-MARKET", r.Reason)
+	}
+}
+
+func TestPriceImpactCurveRunMatchesRunCurve(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-curve")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	runResult := RunMetric(ctx(), impact, Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	curve, curveResult := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if runResult.Determined != curveResult.Determined {
+		t.Errorf("Run determined=%v, RunCurve determined=%v", runResult.Determined, curveResult.Determined)
+	}
+	if runResult.Value.Equal(curveResult.Value) {
+		// Values should match.
+	} else {
+		t.Errorf("Run value=%s, RunCurve value=%s", runResult.Value, curveResult.Value)
+	}
+	if curve == nil && runResult.Determined {
+		t.Error("RunCurve returned nil curve but Run was determined")
+	}
+}
+
+func TestPriceImpactCurveDescriptorIsValid(t *testing.T) {
+	d := PriceImpactMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("price impact curve descriptor: %v", err)
+	}
+}
+
 // deviation metric --------------------------------------------------------------
 //
 // See GitHub issue #103: the gap between the direct book's implied mid and
